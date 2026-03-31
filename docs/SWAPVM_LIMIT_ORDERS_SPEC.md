@@ -298,14 +298,14 @@ Maker can call directly on SwapVM contract:
 ## 7. Contract ABI (Relevant Functions)
 
 ```solidity
-// Read-only: preview swap amounts
+// Preview swap amounts (use via staticcall, NOT marked view)
 function quote(
     Order calldata order,
     address tokenIn,
     address tokenOut,
     uint256 amount,
     bytes calldata takerTraitsAndData
-) external view returns (uint256 amountIn, uint256 amountOut);
+) external returns (uint256 amountIn, uint256 amountOut, bytes32 orderHash);
 
 // Execute swap
 function swap(
@@ -314,7 +314,7 @@ function swap(
     address tokenOut,
     uint256 amount,
     bytes calldata takerTraitsAndData
-) external returns (uint256 amountIn, uint256 amountOut);
+) external returns (uint256 amountIn, uint256 amountOut, bytes32 orderHash);
 
 // Compute EIP-712 hash
 function hash(Order calldata order) external view returns (bytes32);

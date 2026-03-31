@@ -43,7 +43,8 @@ const SwapVMABIJSON = `[
 		"name": "swap",
 		"outputs": [
 			{"name": "amountIn", "type": "uint256"},
-			{"name": "amountOut", "type": "uint256"}
+			{"name": "amountOut", "type": "uint256"},
+			{"name": "orderHash", "type": "bytes32"}
 		],
 		"stateMutability": "nonpayable",
 		"type": "function"
@@ -67,9 +68,10 @@ const SwapVMABIJSON = `[
 		"name": "quote",
 		"outputs": [
 			{"name": "amountIn", "type": "uint256"},
-			{"name": "amountOut", "type": "uint256"}
+			{"name": "amountOut", "type": "uint256"},
+			{"name": "orderHash", "type": "bytes32"}
 		],
-		"stateMutability": "view",
+		"stateMutability": "nonpayable",
 		"type": "function"
 	},
 	{
