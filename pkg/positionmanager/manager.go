@@ -52,6 +52,14 @@ func (m *positionLockMap) Unlock(id [16]byte) {
 	lk.Unlock()
 }
 
+// Remove deletes a single position's mutex from the map.
+// Call after a position reaches a terminal state and the lock is released.
+func (m *positionLockMap) Remove(id [16]byte) {
+	m.mu.Lock()
+	delete(m.locks, id)
+	m.mu.Unlock()
+}
+
 // Cleanup removes mutexes for the given position IDs (e.g. closed/cancelled).
 // Only call when no goroutine holds the lock for these IDs.
 func (m *positionLockMap) Cleanup(ids [][16]byte) int {
@@ -427,6 +435,13 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
 	}
 
+	// Eagerly remove the position lock once it reaches terminal state.
+	// The deferred Unlock above will still work because Remove just deletes from
+	// the map — it does not affect the already-acquired *sync.Mutex value.
+	if pos.State.IsTerminal() {
+		m.posLocks.Remove(pos.ID)
+	}
+
 	m.log.Info("level executed",
 		"position", fmt.Sprintf("%x", pos.ID[:8]),
 		"level", evt.LevelIndex,
@@ -571,7 +586,11 @@ func (m *Manager) CancelPosition(ctx context.Context, id [16]byte) error {
 	m.cancelActiveLevels(pos, pair, -1)
 	pos.State = StateCancelled
 	pos.UpdatedAt = time.Now().Unix()
-	return m.cfg.Store.Update(ctx, pos)
+	if err := m.cfg.Store.Update(ctx, pos); err != nil {
+		return err
+	}
+	m.posLocks.Remove(id)
+	return nil
 }
 
 // UpdateLevel changes the trigger price of a level. Zero gas — off-chain only.
