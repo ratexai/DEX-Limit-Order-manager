@@ -112,6 +112,8 @@ type Position struct {
 	State         PositionState
 	ChainID       uint64
 	PoolFee       uint32 // Uniswap V3 fee tier (500, 3000, 10000).
+	DecimalsBase  uint8  // Token decimals for base (e.g. 18 for WETH).
+	DecimalsQuote uint8  // Token decimals for quote (e.g. 6 for USDC).
 	Levels        []Level
 	CreatedAt     int64 // Unix timestamp.
 	UpdatedAt     int64
@@ -163,9 +165,11 @@ type OpenParams struct {
 	Direction  Direction
 	Size       *big.Int // Total size in base token (wei).
 	EntryPrice *big.Int // Price at entry (8 decimals).
-	ChainID    uint64
-	PoolFee    uint32 // Uniswap V3 fee tier.
-	Levels     []LevelParams
+	ChainID       uint64
+	PoolFee       uint32 // Uniswap V3 fee tier.
+	DecimalsBase  uint8  // Token decimals for base (e.g. 18 for WETH).
+	DecimalsQuote uint8  // Token decimals for quote (e.g. 6 for USDC).
+	Levels        []LevelParams
 }
 
 // LevelParams defines a level at position creation time.
@@ -179,12 +183,14 @@ type LevelParams struct {
 
 // MarketSwapParams are the parameters for an immediate market swap.
 type MarketSwapParams struct {
-	Owner      common.Address
-	TokenIn    common.Address
-	TokenOut   common.Address
-	AmountIn   *big.Int
-	ChainID    uint64
+	Owner       common.Address
+	TokenIn     common.Address
+	TokenOut    common.Address
+	AmountIn    *big.Int
+	ChainID     uint64
 	PoolFee     uint32
+	DecimalsIn  uint8  // Token decimals for input token.
+	DecimalsOut uint8  // Token decimals for output token.
 	SlippageBps uint16 // Max slippage in bps (50 = 0.5%).
 }
 
