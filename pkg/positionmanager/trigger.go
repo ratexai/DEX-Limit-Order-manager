@@ -47,42 +47,17 @@ func NewTriggerEngine() *TriggerEngine {
 }
 
 // Register adds a trigger for a position level.
-// direction determines which side the trigger goes on:
-//   - Long  + SL: below (fires when price drops to trigger)
-//   - Long  + TP: above (fires when price rises to trigger)
-//   - Short + SL: above (fires when price rises to trigger)
-//   - Short + TP: below (fires when price drops to trigger)
 func (e *TriggerEngine) Register(pair TokenPair, posID [16]byte, levelIdx int, levelType LevelType, direction Direction, triggerPrice *big.Int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	pt := e.getOrCreate(pair)
-	entry := triggerEntry{
-		price:      new(big.Int).Set(triggerPrice),
-		positionID: posID,
-		levelIndex: levelIdx,
-		levelType:  levelType,
-	}
-
-	if shouldTriggerAbove(levelType, direction) {
-		pt.above = insertSorted(pt.above, entry)
-	} else {
-		pt.below = insertSorted(pt.below, entry)
-	}
+	e.registerLocked(pair, posID, levelIdx, levelType, direction, triggerPrice)
 }
 
 // Unregister removes all triggers for a specific position level.
 func (e *TriggerEngine) Unregister(pair TokenPair, posID [16]byte, levelIdx int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	pt, ok := e.pairs[pair]
-	if !ok {
-		return
-	}
-
-	pt.above = removeEntry(pt.above, posID, levelIdx)
-	pt.below = removeEntry(pt.below, posID, levelIdx)
+	e.unregisterLocked(pair, posID, levelIdx)
 }
 
 // UnregisterPosition removes all triggers for a position.
@@ -94,15 +69,42 @@ func (e *TriggerEngine) UnregisterPosition(pair TokenPair, posID [16]byte) {
 	if !ok {
 		return
 	}
-
 	pt.above = removePositionEntries(pt.above, posID)
 	pt.below = removePositionEntries(pt.below, posID)
 }
 
-// UpdateTriggerPrice changes the trigger price for a specific position level.
+// UpdateTriggerPrice atomically changes the trigger price for a specific position level.
 func (e *TriggerEngine) UpdateTriggerPrice(pair TokenPair, posID [16]byte, levelIdx int, levelType LevelType, direction Direction, newPrice *big.Int) {
-	e.Unregister(pair, posID, levelIdx)
-	e.Register(pair, posID, levelIdx, levelType, direction, newPrice)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.unregisterLocked(pair, posID, levelIdx)
+	e.registerLocked(pair, posID, levelIdx, levelType, direction, newPrice)
+}
+
+// --- Lock-held internal methods ---
+
+func (e *TriggerEngine) registerLocked(pair TokenPair, posID [16]byte, levelIdx int, levelType LevelType, direction Direction, triggerPrice *big.Int) {
+	pt := e.getOrCreate(pair)
+	entry := triggerEntry{
+		price:      new(big.Int).Set(triggerPrice),
+		positionID: posID,
+		levelIndex: levelIdx,
+		levelType:  levelType,
+	}
+	if shouldTriggerAbove(levelType, direction) {
+		pt.above = insertSorted(pt.above, entry)
+	} else {
+		pt.below = insertSorted(pt.below, entry)
+	}
+}
+
+func (e *TriggerEngine) unregisterLocked(pair TokenPair, posID [16]byte, levelIdx int) {
+	pt, ok := e.pairs[pair]
+	if !ok {
+		return
+	}
+	pt.above = removeEntry(pt.above, posID, levelIdx)
+	pt.below = removeEntry(pt.below, posID, levelIdx)
 }
 
 // OnPrice checks if any triggers fire at the given price.

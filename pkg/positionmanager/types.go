@@ -111,7 +111,7 @@ type Position struct {
 	EntryPrice    *big.Int // Price at entry (quote per base, 8 decimals).
 	State         PositionState
 	ChainID       uint64
-	PoolFee       uint24 // Uniswap V3 fee tier (500, 3000, 10000).
+	PoolFee       uint32 // Uniswap V3 fee tier (500, 3000, 10000).
 	Levels        []Level
 	CreatedAt     int64 // Unix timestamp.
 	UpdatedAt     int64
@@ -164,7 +164,7 @@ type OpenParams struct {
 	Size       *big.Int // Total size in base token (wei).
 	EntryPrice *big.Int // Price at entry (8 decimals).
 	ChainID    uint64
-	PoolFee    uint24 // Uniswap V3 fee tier.
+	PoolFee    uint32 // Uniswap V3 fee tier.
 	Levels     []LevelParams
 }
 
@@ -184,7 +184,7 @@ type MarketSwapParams struct {
 	TokenOut   common.Address
 	AmountIn   *big.Int
 	ChainID    uint64
-	PoolFee    uint24
+	PoolFee     uint32
 	SlippageBps uint16 // Max slippage in bps (50 = 0.5%).
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -43,7 +44,7 @@ type executeSwapParams struct {
 	User        common.Address
 	TokenIn     common.Address
 	TokenOut    common.Address
-	PoolFee     uint24
+	PoolFee     uint32
 	AmountIn    *big.Int
 	MinAmountOut *big.Int
 	FeeBps      uint16
@@ -106,6 +107,10 @@ func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (c
 	}
 
 	if err := e.client.SendTransaction(ctx, signedTx); err != nil {
+		// Rollback nonce so next call retries with the same nonce.
+		e.nonceMu.Lock()
+		e.nextNonce = nonce
+		e.nonceMu.Unlock()
 		return common.Hash{}, fmt.Errorf("send tx: %w", err)
 	}
 
@@ -114,6 +119,9 @@ func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (c
 
 // waitForReceipt waits for a transaction to be mined and returns the receipt.
 func (e *executor) waitForReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	ticker := time.NewTicker(e.cfg.BlockTime / 2)
+	defer ticker.Stop()
+
 	for {
 		receipt, err := e.client.TransactionReceipt(ctx, txHash)
 		if err == nil {
@@ -122,8 +130,7 @@ func (e *executor) waitForReceipt(ctx context.Context, txHash common.Hash) (*typ
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
-			// Poll again on next iteration.
+		case <-ticker.C:
 		}
 	}
 }

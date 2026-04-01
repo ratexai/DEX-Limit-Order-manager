@@ -13,15 +13,21 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
+// Package-level cached constants to avoid recomputing on every call.
+var (
+	slot0ABI    abi.ABI
+	q192        *big.Int // 2^192
+	priceScale8 *big.Int // 10^8
+)
+
+func init() {
+	slot0ABI, _ = abi.JSON(strings.NewReader(`[{"inputs":[],"name":"slot0","outputs":[{"name":"sqrtPriceX96","type":"uint160"},{"name":"tick","type":"int24"},{"name":"observationIndex","type":"uint16"},{"name":"observationCardinality","type":"uint16"},{"name":"observationCardinalityNext","type":"uint16"},{"name":"feeProtocol","type":"uint8"},{"name":"unlocked","type":"bool"}],"stateMutability":"view","type":"function"}]`))
+	q192 = new(big.Int).Exp(big.NewInt(2), big.NewInt(192), nil)
+	priceScale8 = new(big.Int).Exp(big.NewInt(10), big.NewInt(8), nil)
+}
+
 // UniswapV3PriceFeed is a reference PriceFeed implementation that reads
 // prices from Uniswap V3 pools via slot0() polling.
-//
-// Usage:
-//
-//	feed := NewUniswapV3PriceFeed(client, map[TokenPair]common.Address{
-//	    {Base: WETH, Quote: USDC, ChainID: 1}: poolAddress,
-//	})
-//	mgr, _ := positionmanager.New(positionmanager.Config{PriceFeed: feed, ...})
 type UniswapV3PriceFeed struct {
 	client ChainClient
 	pools  map[TokenPair]poolConfig
@@ -29,6 +35,7 @@ type UniswapV3PriceFeed struct {
 	mu      sync.RWMutex
 	prices  map[TokenPair]cachedPrice
 	subs    map[TokenPair][]chan PriceUpdate
+	polling map[TokenPair]bool // Guards against duplicate poll goroutines.
 }
 
 type poolConfig struct {
@@ -64,10 +71,11 @@ func NewUniswapV3PriceFeed(client ChainClient, pools []UniswapV3PoolDef) *Uniswa
 		}
 	}
 	return &UniswapV3PriceFeed{
-		client: client,
-		pools:  poolMap,
-		prices: make(map[TokenPair]cachedPrice),
-		subs:   make(map[TokenPair][]chan PriceUpdate),
+		client:  client,
+		pools:   poolMap,
+		prices:  make(map[TokenPair]cachedPrice),
+		subs:    make(map[TokenPair][]chan PriceUpdate),
+		polling: make(map[TokenPair]bool),
 	}
 }
 
@@ -81,10 +89,15 @@ func (f *UniswapV3PriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-c
 
 	f.mu.Lock()
 	f.subs[pair] = append(f.subs[pair], ch)
+	shouldStart := !f.polling[pair]
+	if shouldStart {
+		f.polling[pair] = true
+	}
 	f.mu.Unlock()
 
-	// Start polling if this is the first subscriber for this pair.
-	go f.pollLoop(ctx, pair)
+	if shouldStart {
+		go f.pollLoop(ctx, pair)
+	}
 
 	return ch, nil
 }
@@ -105,49 +118,65 @@ func (f *UniswapV3PriceFeed) Latest(pair TokenPair) (*big.Int, int64, error) {
 func (f *UniswapV3PriceFeed) pollLoop(ctx context.Context, pair TokenPair) {
 	pool := f.pools[pair]
 
-	// Poll every 2 seconds (suitable for both Ethereum 12s and Base 2s blocks).
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	defer f.cleanupPoll(pair)
 
 	for {
 		select {
 		case <-ctx.Done():
-			f.closeSubs(pair)
 			return
 		case <-ticker.C:
 			price, err := f.readSlot0(ctx, pool)
 			if err != nil {
-				continue // Skip this tick, try again next time.
+				continue
 			}
 
 			now := time.Now().Unix()
+
+			f.mu.Lock()
+			// Skip if price unchanged.
+			if cached, ok := f.prices[pair]; ok && cached.price.Cmp(price) == 0 {
+				f.mu.Unlock()
+				continue
+			}
+			f.prices[pair] = cachedPrice{price: price, timestamp: now}
+			// Copy subscriber slice under lock to avoid races.
+			subs := make([]chan PriceUpdate, len(f.subs[pair]))
+			copy(subs, f.subs[pair])
+			f.mu.Unlock()
+
 			update := PriceUpdate{
 				Pair:      pair,
 				Price:     price,
 				Timestamp: now,
 			}
 
-			f.mu.Lock()
-			f.prices[pair] = cachedPrice{price: price, timestamp: now}
-			subs := f.subs[pair]
-			f.mu.Unlock()
-
 			for _, ch := range subs {
 				select {
 				case ch <- update:
 				default:
-					// Subscriber is slow, drop update.
 				}
 			}
 		}
 	}
 }
 
+// cleanupPoll closes subscriber channels and cleans up state when polling stops.
+func (f *UniswapV3PriceFeed) cleanupPoll(pair TokenPair) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, ch := range f.subs[pair] {
+		close(ch)
+	}
+	delete(f.subs, pair)
+	delete(f.polling, pair)
+}
+
 // readSlot0 calls the Uniswap V3 pool's slot0() function and converts
 // sqrtPriceX96 to a human-readable price with 8 decimals.
 func (f *UniswapV3PriceFeed) readSlot0(ctx context.Context, pool poolConfig) (*big.Int, error) {
-	slot0ABI, _ := abi.JSON(strings.NewReader(`[{"inputs":[],"name":"slot0","outputs":[{"name":"sqrtPriceX96","type":"uint160"},{"name":"tick","type":"int24"},{"name":"observationIndex","type":"uint16"},{"name":"observationCardinality","type":"uint16"},{"name":"observationCardinalityNext","type":"uint16"},{"name":"feeProtocol","type":"uint8"},{"name":"unlocked","type":"bool"}],"stateMutability":"view","type":"function"}]`))
-
 	calldata, err := slot0ABI.Pack("slot0")
 	if err != nil {
 		return nil, err
@@ -177,23 +206,14 @@ func (f *UniswapV3PriceFeed) readSlot0(ctx context.Context, pool poolConfig) (*b
 // If token0IsBase is true, price = quote/base = token1/token0.
 // Otherwise, price = token0/token1.
 func sqrtPriceX96ToPrice(sqrtPriceX96 *big.Int, decimals0, decimals1 uint8, token0IsBase bool) *big.Int {
-	// price_raw = sqrtPriceX96^2 / 2^192
-	// With 8 output decimals: price = sqrtPriceX96^2 * 10^8 * 10^decimals0 / (2^192 * 10^decimals1)
-	// Or inversely if token0 is NOT base.
-
 	sq := new(big.Int).Mul(sqrtPriceX96, sqrtPriceX96)
-
-	// 2^192
-	q192 := new(big.Int).Exp(big.NewInt(2), big.NewInt(192), nil)
-
-	priceDecimals := new(big.Int).Exp(big.NewInt(10), big.NewInt(8), nil) // 10^8 for output
 
 	if token0IsBase {
 		// price (quote per base) = sq * 10^8 * 10^decimals0 / (2^192 * 10^decimals1)
 		dec0 := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil)
 		dec1 := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil)
 
-		num := new(big.Int).Mul(sq, priceDecimals)
+		num := new(big.Int).Mul(sq, priceScale8)
 		num.Mul(num, dec0)
 
 		denom := new(big.Int).Mul(q192, dec1)
@@ -204,19 +224,9 @@ func sqrtPriceX96ToPrice(sqrtPriceX96 *big.Int, decimals0, decimals1 uint8, toke
 	dec0 := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil)
 	dec1 := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil)
 
-	num := new(big.Int).Mul(q192, priceDecimals)
+	num := new(big.Int).Mul(q192, priceScale8)
 	num.Mul(num, dec1)
 
 	denom := new(big.Int).Mul(sq, dec0)
 	return num.Div(num, denom)
-}
-
-func (f *UniswapV3PriceFeed) closeSubs(pair TokenPair) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	for _, ch := range f.subs[pair] {
-		close(ch)
-	}
-	delete(f.subs, pair)
 }

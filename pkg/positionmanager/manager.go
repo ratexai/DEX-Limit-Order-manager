@@ -7,6 +7,8 @@ import (
 	"math/big"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // Manager is the main entry point of the position manager library.
@@ -55,7 +57,8 @@ func New(cfg Config) (*Manager, error) {
 // Run starts the keeper loop. It blocks until ctx is cancelled.
 // It loads active positions, subscribes to price feeds, and dispatches triggers.
 func (m *Manager) Run(ctx context.Context) error {
-	// Load active positions and register triggers.
+	// Load active positions, register triggers, and collect pairs per chain.
+	chainPairs := make(map[uint64][]TokenPair)
 	for chainID := range m.cfg.Chains {
 		positions, err := m.cfg.Store.ListActive(ctx, chainID)
 		if err != nil {
@@ -64,16 +67,15 @@ func (m *Manager) Run(ctx context.Context) error {
 		for _, pos := range positions {
 			m.registerPositionTriggers(pos)
 		}
+		chainPairs[chainID] = uniquePairs(positions, chainID)
 	}
 
-	// Subscribe to price feeds and dispatch triggers.
-	// One goroutine per chain, each with a worker pool for execution.
 	var wg sync.WaitGroup
 	for chainID, ci := range m.cfg.Chains {
 		wg.Add(1)
 		go func(chainID uint64, ci ChainInstance) {
 			defer wg.Done()
-			m.runChain(ctx, chainID, ci)
+			m.runChain(ctx, chainID, ci, chainPairs[chainID])
 		}(chainID, ci)
 	}
 
@@ -82,9 +84,7 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 // runChain runs the keeper loop for a single chain.
-func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance) {
-	// Collect all pairs for this chain.
-	pairs := m.collectPairs(ctx, chainID)
+func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance, pairs []TokenPair) {
 
 	// Subscribe to each pair's price feed.
 	for _, pair := range pairs {
@@ -219,13 +219,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 
 	// Cancel linked levels.
 	if level.Type == LevelTypeSL {
-		// SL fired: cancel all remaining levels.
-		for i := range pos.Levels {
-			if i != evt.LevelIndex && pos.Levels[i].Status == LevelActive {
-				pos.Levels[i].Status = LevelCancelled
-				m.trigger.Unregister(pair, pos.ID, i)
-			}
-		}
+		m.cancelActiveLevels(pos, pair, evt.LevelIndex)
 		pos.State = StateClosed
 	} else {
 		// TP fired.
@@ -373,21 +367,17 @@ func (m *Manager) CancelPosition(ctx context.Context, id [16]byte) error {
 	}
 
 	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
-
-	for i := range pos.Levels {
-		if pos.Levels[i].Status == LevelActive {
-			pos.Levels[i].Status = LevelCancelled
-		}
-	}
+	m.cancelActiveLevels(pos, pair, -1)
 	pos.State = StateCancelled
 	pos.UpdatedAt = time.Now().Unix()
-
-	m.trigger.UnregisterPosition(pair, pos.ID)
 	return m.cfg.Store.Update(ctx, pos)
 }
 
 // UpdateLevel changes the trigger price of a level. Zero gas — off-chain only.
 func (m *Manager) UpdateLevel(ctx context.Context, posID [16]byte, levelIdx int, newTriggerPrice *big.Int) error {
+	if newTriggerPrice == nil || newTriggerPrice.Sign() <= 0 {
+		return fmt.Errorf("invalid trigger price")
+	}
 	pos, err := m.cfg.Store.Get(ctx, posID)
 	if err != nil {
 		return err
@@ -538,12 +528,8 @@ func (m *Manager) computeAmount(pos *Position, level *Level) *big.Int {
 	return amount
 }
 
-// collectPairs returns all unique token pairs for active positions on a chain.
-func (m *Manager) collectPairs(ctx context.Context, chainID uint64) []TokenPair {
-	positions, err := m.cfg.Store.ListActive(ctx, chainID)
-	if err != nil {
-		return nil
-	}
+// uniquePairs extracts unique token pairs from a list of positions.
+func uniquePairs(positions []*Position, chainID uint64) []TokenPair {
 	seen := make(map[TokenPair]bool)
 	var pairs []TokenPair
 	for _, pos := range positions {
@@ -554,6 +540,16 @@ func (m *Manager) collectPairs(ctx context.Context, chainID uint64) []TokenPair 
 		}
 	}
 	return pairs
+}
+
+// cancelActiveLevels cancels all active levels on a position and unregisters them from the trigger engine.
+func (m *Manager) cancelActiveLevels(pos *Position, pair TokenPair, exceptIdx int) {
+	for i := range pos.Levels {
+		if i != exceptIdx && pos.Levels[i].Status == LevelActive {
+			pos.Levels[i].Status = LevelCancelled
+			m.trigger.Unregister(pair, pos.ID, i)
+		}
+	}
 }
 
 func (m *Manager) emitError(evt ErrorEvent) {
