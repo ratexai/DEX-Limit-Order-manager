@@ -11,7 +11,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 ///         swap result goes directly to the user. Platform fee is deducted
 ///         from amountIn before the swap and sent to feeCollector.
 /// @dev    User must approve tokenIn to this contract once.
-///         Only the authorized keeper address can call executeSwap.
+///         Only authorized keeper addresses can call executeSwap.
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -31,8 +31,11 @@ interface ISwapRouter {
 contract SwapExecutor is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /// @notice Authorized keeper address (set at deploy, immutable).
-    address public immutable keeper;
+    /// @notice Contract owner (can manage keepers).
+    address public owner;
+
+    /// @notice Authorized keeper addresses.
+    mapping(address => bool) public keepers;
 
     /// @notice Uniswap V3 SwapRouter02 address (set at deploy, immutable).
     address public immutable swapRouter;
@@ -53,18 +56,48 @@ contract SwapExecutor is ReentrancyGuard {
         uint16 feeBps
     );
 
+    event KeeperUpdated(address indexed keeper, bool authorized);
+    event OwnerTransferred(address indexed previousOwner, address indexed newOwner);
+
     error Unauthorized();
     error FeeTooHigh(uint16 feeBps, uint256 maxFeeBps);
     error ZeroAmount();
     error ZeroAddress();
 
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
+    }
+
+    modifier onlyKeeper() {
+        if (!keepers[msg.sender]) revert Unauthorized();
+        _;
+    }
+
     constructor(address _keeper, address _swapRouter, address _feeCollector) {
         if (_keeper == address(0) || _swapRouter == address(0) || _feeCollector == address(0)) {
             revert ZeroAddress();
         }
-        keeper = _keeper;
+        owner = msg.sender;
+        keepers[_keeper] = true;
         swapRouter = _swapRouter;
         feeCollector = _feeCollector;
+
+        emit KeeperUpdated(_keeper, true);
+    }
+
+    /// @notice Add or remove a keeper address. Only callable by owner.
+    function setKeeper(address _keeper, bool _authorized) external onlyOwner {
+        if (_keeper == address(0)) revert ZeroAddress();
+        keepers[_keeper] = _authorized;
+        emit KeeperUpdated(_keeper, _authorized);
+    }
+
+    /// @notice Transfer ownership to a new address. Only callable by owner.
+    function transferOwnership(address _newOwner) external onlyOwner {
+        if (_newOwner == address(0)) revert ZeroAddress();
+        emit OwnerTransferred(owner, _newOwner);
+        owner = _newOwner;
     }
 
     /// @notice Execute a swap on behalf of a user via Uniswap V3.
@@ -85,8 +118,7 @@ contract SwapExecutor is ReentrancyGuard {
         uint256 amountIn,
         uint256 minAmountOut,
         uint16 feeBps
-    ) external nonReentrant returns (uint256 amountOut) {
-        if (msg.sender != keeper) revert Unauthorized();
+    ) external nonReentrant onlyKeeper returns (uint256 amountOut) {
         if (amountIn == 0) revert ZeroAmount();
         if (feeBps > MAX_FEE_BPS) revert FeeTooHigh(feeBps, MAX_FEE_BPS);
 

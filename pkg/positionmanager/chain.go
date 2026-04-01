@@ -16,8 +16,11 @@ type ChainClient interface {
 	// SendTransaction broadcasts a signed transaction.
 	SendTransaction(ctx context.Context, tx *types.Transaction) error
 
-	// SuggestGasPrice returns the suggested gas price.
+	// SuggestGasPrice returns the suggested gas price (legacy tx fallback).
 	SuggestGasPrice(ctx context.Context) (*big.Int, error)
+
+	// SuggestGasTipCap returns the suggested EIP-1559 priority fee (tip).
+	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 
 	// PendingNonceAt returns the next nonce for the account.
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)

@@ -51,36 +51,42 @@ type executeSwapParams struct {
 	Priority    Priority
 }
 
-// executeSwap calls SwapExecutor.executeSwap on-chain.
-// Returns the tx hash on success. The caller is responsible for waiting for the receipt.
-func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (common.Hash, error) {
+// executeSwap calls SwapExecutor.executeSwap on-chain, waits for the transaction
+// to be mined, and verifies the receipt status. Returns the tx hash, receipt, and error.
+func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (common.Hash, *types.Receipt, error) {
+	// ABI expects uint24 for poolFee and uint16 for feeBps — go-ethereum
+	// maps sub-32-bit uints to *big.Int, so we convert here.
+	poolFeeBig := new(big.Int).SetUint64(uint64(params.PoolFee))
+	feeBpsBig := new(big.Int).SetUint64(uint64(params.FeeBps))
+
 	calldata, err := parsedSwapExecutorABI.Pack(
 		"executeSwap",
 		params.User,
 		params.TokenIn,
 		params.TokenOut,
-		params.PoolFee,
+		poolFeeBig,
 		params.AmountIn,
 		params.MinAmountOut,
-		params.FeeBps,
+		feeBpsBig,
 	)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("pack calldata: %w", err)
+		return common.Hash{}, nil, fmt.Errorf("pack calldata: %w", err)
 	}
 
-	gasPrice, err := e.suggestGasPrice(ctx, params.Priority)
+	gasTipCap, maxFeeCap, err := e.suggestGasFees(ctx, params.Priority)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("suggest gas price: %w", err)
+		return common.Hash{}, nil, fmt.Errorf("suggest gas fees: %w", err)
 	}
 
 	gasLimit, err := e.client.EstimateGas(ctx, ethereum.CallMsg{
-		From:     e.keeperAddr,
-		To:       &e.executorAddr,
-		GasPrice: gasPrice,
-		Data:     calldata,
+		From:      e.keeperAddr,
+		To:        &e.executorAddr,
+		GasFeeCap: maxFeeCap,
+		GasTipCap: gasTipCap,
+		Data:      calldata,
 	})
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("estimate gas: %w", err)
+		return common.Hash{}, nil, fmt.Errorf("estimate gas: %w", err)
 	}
 
 	// Add buffer to gas limit.
@@ -88,33 +94,44 @@ func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (c
 
 	nonce, err := e.acquireNonce(ctx)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("acquire nonce: %w", err)
+		return common.Hash{}, nil, fmt.Errorf("acquire nonce: %w", err)
 	}
 
-	tx := types.NewTransaction(
-		nonce,
-		e.executorAddr,
-		big.NewInt(0), // No ETH value.
-		gasLimit,
-		gasPrice,
-		calldata,
-	)
+	tx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   e.chainID,
+		Nonce:     nonce,
+		GasTipCap: gasTipCap,
+		GasFeeCap: maxFeeCap,
+		Gas:       gasLimit,
+		To:        &e.executorAddr,
+		Value:     big.NewInt(0),
+		Data:      calldata,
+	})
 
-	signer := types.NewEIP155Signer(e.chainID)
+	signer := types.LatestSignerForChainID(e.chainID)
 	signedTx, err := types.SignTx(tx, signer, e.keeperKey)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("sign tx: %w", err)
+		e.rollbackNonce(nonce)
+		return common.Hash{}, nil, fmt.Errorf("sign tx: %w", err)
 	}
 
 	if err := e.client.SendTransaction(ctx, signedTx); err != nil {
-		// Rollback nonce so next call retries with the same nonce.
-		e.nonceMu.Lock()
-		e.nextNonce = nonce
-		e.nonceMu.Unlock()
-		return common.Hash{}, fmt.Errorf("send tx: %w", err)
+		e.rollbackNonce(nonce)
+		return common.Hash{}, nil, fmt.Errorf("send tx: %w", err)
 	}
 
-	return signedTx.Hash(), nil
+	txHash := signedTx.Hash()
+
+	// Wait for the transaction to be mined and verify success.
+	receipt, err := e.waitForReceipt(ctx, txHash)
+	if err != nil {
+		return txHash, nil, fmt.Errorf("wait for receipt: %w", err)
+	}
+	if receipt.Status == 0 {
+		return txHash, receipt, fmt.Errorf("tx reverted: %s", txHash.Hex())
+	}
+
+	return txHash, receipt, nil
 }
 
 // waitForReceipt waits for a transaction to be mined and returns the receipt.
@@ -135,11 +152,15 @@ func (e *executor) waitForReceipt(ctx context.Context, txHash common.Hash) (*typ
 	}
 }
 
-// suggestGasPrice returns the gas price with the appropriate multiplier.
-func (e *executor) suggestGasPrice(ctx context.Context, priority Priority) (*big.Int, error) {
-	base, err := e.client.SuggestGasPrice(ctx)
+// suggestGasFees returns EIP-1559 gas parameters (gasTipCap, gasFeeCap) with priority multiplier.
+func (e *executor) suggestGasFees(ctx context.Context, priority Priority) (gasTipCap, gasFeeCap *big.Int, err error) {
+	baseFee, err := e.client.SuggestGasPrice(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	tipCap, err := e.client.SuggestGasTipCap(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	multiplier := e.cfg.TPGasMultiplier
@@ -147,18 +168,22 @@ func (e *executor) suggestGasPrice(ctx context.Context, priority Priority) (*big
 		multiplier = e.cfg.SLGasMultiplier
 	}
 
-	// Multiply: gasPrice = base * multiplier.
-	// Use integer math: multiply by (multiplier * 100), divide by 100.
+	// Apply multiplier to tip for priority escalation.
 	mult := int64(multiplier * 100)
-	gasPrice := new(big.Int).Mul(base, big.NewInt(mult))
-	gasPrice.Div(gasPrice, big.NewInt(100))
+	gasTipCap = new(big.Int).Mul(tipCap, big.NewInt(mult))
+	gasTipCap.Div(gasTipCap, big.NewInt(100))
 
-	// Enforce max gas price cap.
-	if e.cfg.MaxGasPrice != nil && gasPrice.Cmp(e.cfg.MaxGasPrice) > 0 {
-		gasPrice.Set(e.cfg.MaxGasPrice)
+	// maxFee = baseFee * multiplier + gasTipCap
+	gasFeeCap = new(big.Int).Mul(baseFee, big.NewInt(mult))
+	gasFeeCap.Div(gasFeeCap, big.NewInt(100))
+	gasFeeCap.Add(gasFeeCap, gasTipCap)
+
+	// Enforce max gas price cap on gasFeeCap.
+	if e.cfg.MaxGasPrice != nil && gasFeeCap.Cmp(e.cfg.MaxGasPrice) > 0 {
+		gasFeeCap.Set(e.cfg.MaxGasPrice)
 	}
 
-	return gasPrice, nil
+	return gasTipCap, gasFeeCap, nil
 }
 
 // applyGasBuffer adds a safety buffer to the gas estimate.
@@ -188,6 +213,13 @@ func (e *executor) acquireNonce(ctx context.Context) (uint64, error) {
 	return nonce, nil
 }
 
+// rollbackNonce decrements nonce after a failed sign or send, so the next call reuses it.
+func (e *executor) rollbackNonce(nonce uint64) {
+	e.nonceMu.Lock()
+	e.nextNonce = nonce
+	e.nonceMu.Unlock()
+}
+
 // resyncNonce resets the nonce from chain state (call after "nonce too low" error).
 func (e *executor) resyncNonce(ctx context.Context) error {
 	e.nonceMu.Lock()
@@ -199,6 +231,26 @@ func (e *executor) resyncNonce(ctx context.Context) error {
 	}
 	e.nextNonce = nonce
 	e.nonceInit = true
+	return nil
+}
+
+// parseAmountOutFromReceipt extracts the actual amountOut from the SwapExecuted event
+// in the transaction receipt. Returns nil if the event is not found.
+func parseAmountOutFromReceipt(receipt *types.Receipt, executorAddr common.Address) *big.Int {
+	swapExecutedID := parsedSwapExecutorABI.Events["SwapExecuted"].ID
+	for _, log := range receipt.Logs {
+		if log.Address != executorAddr || len(log.Topics) == 0 || log.Topics[0] != swapExecutedID {
+			continue
+		}
+		outputs, err := parsedSwapExecutorABI.Events["SwapExecuted"].Inputs.NonIndexed().Unpack(log.Data)
+		if err != nil || len(outputs) < 2 {
+			continue
+		}
+		// SwapExecuted non-indexed fields: amountIn, amountOut, feeAmount, feeBps
+		if amountOut, ok := outputs[1].(*big.Int); ok {
+			return new(big.Int).Set(amountOut)
+		}
+	}
 	return nil
 }
 

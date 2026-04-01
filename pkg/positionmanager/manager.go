@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +17,38 @@ import (
 // Create one via New(), then call Run() in a goroutine to start the keeper loop.
 type Manager struct {
 	cfg       Config
+	log       *slog.Logger
 	trigger   *TriggerEngine
 	executors map[uint64]*executor // chainID → executor
-	mu        sync.RWMutex
+	posLocks  positionLockMap      // Per-position mutex to serialize executions.
+}
+
+// positionLockMap provides per-position mutual exclusion so that concurrent
+// trigger executions for the same position are serialized.
+type positionLockMap struct {
+	mu    sync.Mutex
+	locks map[[16]byte]*sync.Mutex
+}
+
+func (m *positionLockMap) Lock(id [16]byte) {
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[[16]byte]*sync.Mutex)
+	}
+	lk, ok := m.locks[id]
+	if !ok {
+		lk = &sync.Mutex{}
+		m.locks[id] = lk
+	}
+	m.mu.Unlock()
+	lk.Lock()
+}
+
+func (m *positionLockMap) Unlock(id [16]byte) {
+	m.mu.Lock()
+	lk := m.locks[id]
+	m.mu.Unlock()
+	lk.Unlock()
 }
 
 // New creates a new Manager with the given configuration.
@@ -47,8 +78,14 @@ func New(cfg Config) (*Manager, error) {
 		executors[chainID] = newExecutor(ci.Client, ci.KeeperKey, ci.ExecutorAddress, chainID, ci.ChainConfig)
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Manager{
 		cfg:       cfg,
+		log:       logger,
 		trigger:   NewTriggerEngine(),
 		executors: executors,
 	}, nil
@@ -83,8 +120,36 @@ func (m *Manager) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// runChain runs the keeper loop for a single chain.
+// runChain runs the keeper loop for a single chain with a bounded worker pool.
 func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance, pairs []TokenPair) {
+	workers := ci.ExecutorWorkers
+	if workers <= 0 {
+		workers = 4
+	}
+
+	// Buffered channel for trigger events awaiting execution.
+	execCh := make(chan TriggerEvent, workers*4)
+
+	var wg sync.WaitGroup
+
+	// Start execution workers.
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case evt, ok := <-execCh:
+					if !ok {
+						return
+					}
+					m.executeTrigger(ctx, evt)
+				}
+			}
+		}()
+	}
 
 	// Subscribe to each pair's price feed.
 	for _, pair := range pairs {
@@ -94,7 +159,9 @@ func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance
 			continue
 		}
 
+		wg.Add(1)
 		go func(pair TokenPair, ch <-chan PriceUpdate) {
+			defer wg.Done()
 			for {
 				select {
 				case <-ctx.Done():
@@ -103,28 +170,36 @@ func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance
 					if !ok {
 						return
 					}
-					m.handlePriceUpdate(ctx, update)
+					m.handlePriceUpdate(ctx, update, execCh)
 				}
 			}
 		}(pair, ch)
 	}
 
-	// Block until context cancelled.
-	<-ctx.Done()
+	// Wait for all goroutines to finish.
+	wg.Wait()
+	close(execCh)
 }
 
-// handlePriceUpdate processes a single price update.
-func (m *Manager) handlePriceUpdate(ctx context.Context, update PriceUpdate) {
+// handlePriceUpdate processes a single price update by dispatching
+// triggered events to the execution channel.
+func (m *Manager) handlePriceUpdate(ctx context.Context, update PriceUpdate, execCh chan<- TriggerEvent) {
 	events := m.trigger.OnPrice(update.Pair, update.Price)
 	for _, evt := range events {
-		// Execute in the current goroutine for simplicity.
-		// Production: use a worker pool with ci.ExecutorWorkers goroutines.
-		m.executeTrigger(ctx, evt)
+		select {
+		case execCh <- evt:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
 // executeTrigger handles a single trigger event: execute swap, update state.
+// Per-position locking ensures concurrent triggers for the same position are serialized.
 func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
+	m.posLocks.Lock(evt.PositionID)
+	defer m.posLocks.Unlock(evt.PositionID)
+
 	pos, err := m.cfg.Store.Get(ctx, evt.PositionID)
 	if err != nil {
 		m.emitError(ErrorEvent{PositionID: evt.PositionID, LevelIndex: evt.LevelIndex, ChainID: evt.ChainID, Err: err})
@@ -168,17 +243,20 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		priority = PriorityCritical
 	}
 
-	// Compute minAmountOut (simplified — assumes 18/6 decimals for base/quote).
-	// TODO: fetch actual decimals from chain.
-	minAmountOut := computeMinAmountOut(level.TriggerPrice, amountIn, slippageBps, 18, 6)
+	// Determine token decimals based on swap direction.
+	decimalsIn, decimalsOut := pos.DecimalsBase, pos.DecimalsQuote
+	if pos.Direction == Short {
+		decimalsIn, decimalsOut = pos.DecimalsQuote, pos.DecimalsBase
+	}
+	minAmountOut := computeMinAmountOut(level.TriggerPrice, amountIn, slippageBps, decimalsIn, decimalsOut)
 
 	var feeBps uint16
 	if feeCfg != nil {
 		feeBps = feeCfg.FeeBps
 	}
 
-	// Execute on-chain swap.
-	txHash, err := exec.executeSwap(ctx, executeSwapParams{
+	// Execute on-chain swap and wait for receipt.
+	txHash, receipt, err := exec.executeSwap(ctx, executeSwapParams{
 		User:         pos.Owner,
 		TokenIn:      tokenIn,
 		TokenOut:     tokenOut,
@@ -189,6 +267,25 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		Priority:     priority,
 	})
 	if err != nil {
+		m.log.Error("swap execution failed",
+			"position", fmt.Sprintf("%x", evt.PositionID[:8]),
+			"level", evt.LevelIndex,
+			"type", level.Type.String(),
+			"chain", pos.ChainID,
+			"error", err,
+		)
+
+		// Resync nonce on "nonce too low" type errors.
+		if strings.Contains(err.Error(), "nonce") {
+			if resyncErr := exec.resyncNonce(ctx); resyncErr != nil {
+				m.log.Error("nonce resync failed", "chain", pos.ChainID, "error", resyncErr)
+			}
+		}
+
+		// Re-register the trigger so it fires again on the next price update.
+		pair := pos.Pair()
+		m.trigger.Register(pair, pos.ID, evt.LevelIndex, level.Type, pos.Direction, level.TriggerPrice)
+
 		m.emitError(ErrorEvent{
 			PositionID: evt.PositionID,
 			LevelIndex: evt.LevelIndex,
@@ -197,6 +294,12 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 			Retryable:  true,
 		})
 		return
+	}
+
+	// Parse actual amountOut from receipt logs.
+	actualAmountOut := parseAmountOutFromReceipt(receipt, exec.executorAddr)
+	if actualAmountOut == nil {
+		actualAmountOut = minAmountOut // Fallback if event parsing fails.
 	}
 
 	// Update level execution results.
@@ -215,7 +318,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 	pos.UpdatedAt = now
 
 	// Handle post-trigger actions.
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 
 	// Cancel linked levels.
 	if level.Type == LevelTypeSL {
@@ -259,6 +362,17 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
 	}
 
+	m.log.Info("level executed",
+		"position", fmt.Sprintf("%x", pos.ID[:8]),
+		"level", evt.LevelIndex,
+		"type", level.Type.String(),
+		"chain", pos.ChainID,
+		"tx", txHash.Hex(),
+		"amountIn", amountIn.String(),
+		"amountOut", actualAmountOut.String(),
+		"state", pos.State.String(),
+	)
+
 	// Emit execution event to host.
 	if m.cfg.OnExecution != nil {
 		slMovedTo := new(big.Int)
@@ -275,7 +389,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 			TokenIn:       tokenIn,
 			TokenOut:      tokenOut,
 			AmountIn:      amountIn,
-			AmountOut:     minAmountOut, // Approximate; actual comes from receipt.
+			AmountOut:     actualAmountOut,
 			ExecPrice:     evt.Price,
 			TxHash:        txHash,
 			Fee:           computeFeeResult(amountIn, feeCfg),
@@ -300,6 +414,26 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 		return nil, fmt.Errorf("unsupported chain %d", params.ChainID)
 	}
 
+	// Validate levels.
+	var totalPortionBps uint32
+	for i, lp := range params.Levels {
+		if lp.TriggerPrice == nil || lp.TriggerPrice.Sign() <= 0 {
+			return nil, fmt.Errorf("level %d: invalid trigger price", i)
+		}
+		if lp.PortionBps == 0 || lp.PortionBps > 10000 {
+			return nil, fmt.Errorf("level %d: invalid portion %d bps", i, lp.PortionBps)
+		}
+		totalPortionBps += uint32(lp.PortionBps)
+		for _, idx := range lp.CancelOnFire {
+			if idx < 0 || idx >= len(params.Levels) {
+				return nil, fmt.Errorf("level %d: CancelOnFire index %d out of range", i, idx)
+			}
+		}
+	}
+	if totalPortionBps > 10000 {
+		return nil, fmt.Errorf("total PortionBps %d exceeds 10000", totalPortionBps)
+	}
+
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, fmt.Errorf("generate ID: %w", err)
@@ -318,6 +452,8 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 		State:         StateActive,
 		ChainID:       params.ChainID,
 		PoolFee:       params.PoolFee,
+		DecimalsBase:  params.DecimalsBase,
+		DecimalsQuote: params.DecimalsQuote,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -366,7 +502,7 @@ func (m *Manager) CancelPosition(ctx context.Context, id [16]byte) error {
 		return fmt.Errorf("position already %s", pos.State)
 	}
 
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 	m.cancelActiveLevels(pos, pair, -1)
 	pos.State = StateCancelled
 	pos.UpdatedAt = time.Now().Unix()
@@ -393,7 +529,7 @@ func (m *Manager) UpdateLevel(ctx context.Context, posID [16]byte, levelIdx int,
 		return fmt.Errorf("level %d is %v, not active", levelIdx, level.Status)
 	}
 
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 	level.TriggerPrice = new(big.Int).Set(newTriggerPrice)
 	pos.UpdatedAt = time.Now().Unix()
 
@@ -425,7 +561,7 @@ func (m *Manager) AddLevel(ctx context.Context, posID [16]byte, lp LevelParams) 
 	pos.Levels = append(pos.Levels, level)
 	pos.UpdatedAt = time.Now().Unix()
 
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 	m.trigger.Register(pair, pos.ID, level.Index, level.Type, pos.Direction, level.TriggerPrice)
 	return m.cfg.Store.Update(ctx, pos)
 }
@@ -446,7 +582,7 @@ func (m *Manager) RemoveLevel(ctx context.Context, posID [16]byte, levelIdx int)
 	pos.Levels[levelIdx].Status = LevelCancelled
 	pos.UpdatedAt = time.Now().Unix()
 
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 	m.trigger.Unregister(pair, pos.ID, levelIdx)
 	return m.cfg.Store.Update(ctx, pos)
 }
@@ -470,14 +606,14 @@ func (m *Manager) MarketSwap(ctx context.Context, params MarketSwapParams) (*Swa
 		return nil, fmt.Errorf("get price: %w", err)
 	}
 
-	minAmountOut := computeMinAmountOut(price, params.AmountIn, params.SlippageBps, 18, 6)
+	minAmountOut := computeMinAmountOut(price, params.AmountIn, params.SlippageBps, params.DecimalsIn, params.DecimalsOut)
 
 	var feeBps uint16
 	if feeCfg != nil {
 		feeBps = feeCfg.FeeBps
 	}
 
-	txHash, err := exec.executeSwap(ctx, executeSwapParams{
+	txHash, receipt, err := exec.executeSwap(ctx, executeSwapParams{
 		User:         params.Owner,
 		TokenIn:      params.TokenIn,
 		TokenOut:     params.TokenOut,
@@ -491,10 +627,15 @@ func (m *Manager) MarketSwap(ctx context.Context, params MarketSwapParams) (*Swa
 		return nil, err
 	}
 
+	actualAmountOut := parseAmountOutFromReceipt(receipt, exec.executorAddr)
+	if actualAmountOut == nil {
+		actualAmountOut = minAmountOut
+	}
+
 	return &SwapResult{
 		TxHash:    txHash,
 		AmountIn:  params.AmountIn,
-		AmountOut: minAmountOut,
+		AmountOut: actualAmountOut,
 		Fee:       computeFeeResult(params.AmountIn, feeCfg),
 	}, nil
 }
@@ -503,7 +644,7 @@ func (m *Manager) MarketSwap(ctx context.Context, params MarketSwapParams) (*Swa
 
 // registerPositionTriggers registers all active levels of a position with the trigger engine.
 func (m *Manager) registerPositionTriggers(pos *Position) {
-	pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: pos.ChainID}
+	pair := pos.Pair()
 	for _, level := range pos.Levels {
 		if level.Status == LevelActive {
 			m.trigger.Register(pair, pos.ID, level.Index, level.Type, pos.Direction, level.TriggerPrice)
@@ -523,17 +664,15 @@ func (m *Manager) swapTokens(pos *Position, level *Level) (tokenIn, tokenOut com
 
 // computeAmount calculates the swap amount for a level based on remaining size and portion.
 func (m *Manager) computeAmount(pos *Position, level *Level) *big.Int {
-	amount := new(big.Int).Mul(pos.RemainingSize, big.NewInt(int64(level.PortionBps)))
-	amount.Div(amount, big.NewInt(10000))
-	return amount
+	return mulBps(pos.RemainingSize, level.PortionBps)
 }
 
 // uniquePairs extracts unique token pairs from a list of positions.
-func uniquePairs(positions []*Position, chainID uint64) []TokenPair {
+func uniquePairs(positions []*Position, _ uint64) []TokenPair {
 	seen := make(map[TokenPair]bool)
 	var pairs []TokenPair
 	for _, pos := range positions {
-		pair := TokenPair{Base: pos.TokenBase, Quote: pos.TokenQuote, ChainID: chainID}
+		pair := pos.Pair()
 		if !seen[pair] {
 			seen[pair] = true
 			pairs = append(pairs, pair)
