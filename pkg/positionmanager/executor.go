@@ -279,8 +279,9 @@ func parseAmountOutFromReceipt(receipt *types.Receipt, executorAddr common.Addre
 // packSwapCalldata builds the ABI-encoded calldata for the appropriate swap function
 // based on the execution mode.
 func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
+	// go-ethereum ABI packer expects native Go types matching Solidity types:
+	// uint24 (poolFee) → *big.Int, uint16 (feeBps) → uint16
 	poolFeeBig := new(big.Int).SetUint64(uint64(params.PoolFee))
-	feeBpsBig := new(big.Int).SetUint64(uint64(params.FeeBps))
 
 	switch params.Mode {
 	case ExecModeLegacy:
@@ -293,7 +294,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			poolFeeBig,
 			params.AmountIn,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 		)
 
 	case ExecModePermit2Allowance:
@@ -306,7 +307,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			poolFeeBig,
 			params.AmountIn,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 		)
 
 	case ExecModePermit2Signature:
@@ -335,7 +336,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			params.TokenOut,
 			poolFeeBig,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 			permit,
 			params.PermitSignature,
 		)

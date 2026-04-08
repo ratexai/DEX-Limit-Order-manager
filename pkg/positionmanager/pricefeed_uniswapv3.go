@@ -338,9 +338,11 @@ func tickToPrice(tick int64, decimals0, decimals1 uint8, token0IsBase bool) *big
 		adjusted = 1.0 / adjusted
 	}
 
-	// Scale to 8 decimals.
-	scaled := adjusted * 1e8
-	return new(big.Int).SetUint64(uint64(scaled))
+	// Scale to 8 decimals using big.Float to avoid uint64 overflow for large prices.
+	scaledFloat := new(big.Float).SetFloat64(adjusted)
+	scaledFloat.Mul(scaledFloat, new(big.Float).SetFloat64(1e8))
+	result, _ := scaledFloat.Int(nil)
+	return result
 }
 
 // sqrtPriceX96ToPrice converts Uniswap V3 sqrtPriceX96 to a price with 8 decimals.

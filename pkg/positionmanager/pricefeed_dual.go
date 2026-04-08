@@ -529,6 +529,8 @@ func parseFloatPrice(s string) (*big.Int, error) {
 		return nil, fmt.Errorf("invalid price string: %s", s)
 	}
 	scaled := new(big.Float).Mul(f, new(big.Float).SetFloat64(1e8))
+	// Add 0.5 before truncating to get proper rounding.
+	scaled.Add(scaled, new(big.Float).SetFloat64(0.5))
 	result, _ := scaled.Int(nil)
 	return result, nil
 }
