@@ -123,7 +123,6 @@ result, err := mgr.MarketSwap(ctx, pm.MarketSwapParams{
 
 ```
 contracts/
-  SwapExecutor.sol          Legacy executor (backward compat)
   SwapExecutorV2.sol        Permit2-integrated executor + native ETH
 
 pkg/positionmanager/        All library code in one package
@@ -132,14 +131,15 @@ pkg/positionmanager/        All library code in one package
   executor.go               On-chain TX execution, gas strategy, nonce management
   permit.go                 EIP-712 typed data, ecrecover, permit validation
   permit2_abi.go            Permit2 + SwapExecutorV2 ABI bindings
-  executor_abi.go           SwapExecutor V1 ABI bindings
+  executor_abi.go           SwapExecutor ABI bindings
   types.go                  Position, Level, OpenParams, enums
   config.go                 ChainConfig, EthereumDefaults, BSCDefaults, BaseDefaults
   events.go                 ExecutionEvent, ErrorEvent, PermitExpiryEvent
   fees.go                   FeeProvider interface, fee calculation
   store.go                  Store interface (host implements)
   pricefeed.go              PriceFeed interface
-  pricefeed_uniswapv3.go    Reference impl: Uniswap V3 slot0 + TWAP
+  pricefeed_uniswapv3.go    Reference impl: Uniswap V3 slot0 + TWAP (polling)
+  pricefeed_dual.go         Production impl: WS Swap events + OKX cross-check
   chain.go                  ChainClient interface (go-ethereum compatible)
   circuitbreaker.go         Circuit breaker for executor resilience
   ratelimiter.go            RPC rate limiter (token bucket)
@@ -149,6 +149,96 @@ pkg/positionmanager/        All library code in one package
 docs/
   POSITION_MANAGER_V3.md    Full architecture document
   AUTH_BOUNDARY.md           Security responsibility matrix
+```
+
+## PriceFeed Architecture
+
+The keeper needs real-time prices to evaluate trigger conditions (`triggerPrice` vs `currentPrice`). Two implementations are provided:
+
+### UniswapV3PriceFeed (simple, polling)
+
+Polls `slot0()` every 2 seconds via `eth_call`. Good for development and low-traffic pairs.
+
+### DualPriceFeed (production, event-driven)
+
+Dual-source stateless service. No own data pipeline — reliability on two external sources.
+
+```
+Uniswap V3 / PancakeSwap V3 Pool              OKX DEX Ticker API
+              │                                        │
+         Swap events                              HTTP poll
+         via WebSocket                            every 10s
+        (sub-second)                                   │
+              │                                        │
+              ▼                                        ▼
+     priceFromSwapLog()                        fetchOKXPrice()
+     extract sqrtPriceX96                      parse mid-price
+     from event ABI data                            │
+              │                                     │
+              ▼                                     ▼
+       ┌──────────────── cross-check ──────────────────┐
+       │  computeDeviationBps(onChain, okx)            │
+       │  > MaxDeviation (2%) → flag, on-chain wins    │
+       │  ≤ MaxDeviation → confirmed from both sources │
+       └───────────────────────────────────────────────┘
+              │
+              ▼
+       publishPrice()
+              │
+              ▼
+       Subscribers (TriggerEngine)
+              │
+              ▼
+       Keeper executes when triggerPrice reached
+```
+
+**3 goroutines per pair:**
+
+| Goroutine | Role |
+|-----------|------|
+| `runSwapListener` | WebSocket subscription to Swap events. On each event, extracts `sqrtPriceX96` from log data. Auto-reconnects via `slot0()` polling fallback if WS drops. |
+| `runOKXPoller` | Polls OKX DEX aggregator API every 10s. Cross-checks with on-chain price. If deviation > 2%, flags it (on-chain remains source of truth). |
+| `runStaleWatchdog` | If no Swap events for 30s (configurable), forces a `slot0()` read. If that also fails, uses OKX price as emergency fallback. |
+
+**Why this design:**
+- **Swap events = real-time** — price updates arrive the moment a trade happens, not on a polling interval
+- **OKX = independent source** — catches cases where on-chain data is stale or manipulated
+- **Staleness watchdog** — pairs with low volume still get fresh prices
+- **No own infrastructure** — downtime = missed price = lost money, so depend on battle-tested external sources
+
+**Usage:**
+
+```go
+import pm "github.com/ratexai/dex-limit-order-manager/pkg/positionmanager"
+
+// Create WebSocket-capable client (go-ethereum ethclient via ws:// or wss://)
+wsClient, _ := ethclient.Dial("wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")
+
+feed, _ := pm.NewDualPriceFeed(pm.DualPriceFeedConfig{
+    WSClient: wsClient,
+    Pools: []pm.UniswapV3PoolDef{
+        {
+            Pair:           pm.TokenPair{Base: weth, Quote: usdc, ChainID: 1},
+            PoolAddress:    common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8"),
+            Token0Decimals: 6,  // USDC is token0
+            Token1Decimals: 18, // WETH is token1
+            Token0IsBase:   false,
+        },
+    },
+    OKX: &pm.OKXConfig{
+        ChainIndex:   "1",           // Ethereum
+        PollInterval: 10 * time.Second,
+    },
+    MaxDeviation:   200,              // 2% max deviation before flagging
+    StaleThreshold: 30 * time.Second, // Force refresh after 30s of silence
+})
+defer feed.Close()
+
+// Pass to Manager as PriceFeed:
+mgr, _ := pm.New(pm.Config{
+    PriceFeed: feed,
+    // ... other config
+})
 ```
 
 ## Key Design Decisions
