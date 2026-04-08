@@ -348,7 +348,22 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 
 // activatePermit submits a transaction to activate a Permit2 allowance on-chain.
 // This is called once per position before the first level execution.
+// Permit2 type bounds: prevent silent ABI truncation.
+var maxUint48 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 48), big.NewInt(1))   // 2^48 - 1
+var maxUint160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1)) // 2^160 - 1
+
 func (e *executor) activatePermit(ctx context.Context, params activatePermitParams) (common.Hash, error) {
+	// Validate Permit2 type bounds to prevent silent ABI truncation.
+	if params.Amount != nil && params.Amount.Cmp(maxUint160) > 0 {
+		return common.Hash{}, fmt.Errorf("permit amount exceeds uint160 max")
+	}
+	if params.Expiration > maxUint48.Uint64() {
+		return common.Hash{}, fmt.Errorf("permit expiration exceeds uint48 max")
+	}
+	if params.Nonce > maxUint48.Uint64() {
+		return common.Hash{}, fmt.Errorf("permit nonce exceeds uint48 max")
+	}
+
 	// Build the PermitSingle struct for the ABI call.
 	type permitDetails struct {
 		Token      common.Address

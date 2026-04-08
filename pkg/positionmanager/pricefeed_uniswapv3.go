@@ -3,7 +3,6 @@ package positionmanager
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/big"
 	"strings"
 	"sync"
@@ -320,28 +319,49 @@ func (f *UniswapV3PriceFeed) readTWAP(ctx context.Context, pool poolConfig, wind
 }
 
 // tickToPrice converts a Uniswap V3 tick to a price with 8 decimals.
+// Uses big.Float arithmetic throughout to avoid float64 overflow/precision loss.
 // price = 1.0001^tick, adjusted for token decimals and direction.
 func tickToPrice(tick int64, decimals0, decimals1 uint8, token0IsBase bool) *big.Int {
 	// price0 = 1.0001^tick (token1 per token0)
-	priceFloat := math.Pow(1.0001, float64(tick))
+	// Use big.Float with 256-bit precision to handle extreme ticks.
+	base := new(big.Float).SetPrec(256).SetFloat64(1.0001)
+	priceFloat := new(big.Float).SetPrec(256).SetFloat64(1.0)
 
-	// Adjust for decimals: raw price is in token1/token0 with implicit decimal shift.
-	// Actual price = priceFloat * 10^decimals0 / 10^decimals1
-	decimalAdjust := math.Pow(10, float64(decimals0)-float64(decimals1))
-	adjusted := priceFloat * decimalAdjust
-
-	if !token0IsBase {
-		// If token0 is quote, invert.
-		if adjusted == 0 {
-			return new(big.Int)
+	absTick := tick
+	if absTick < 0 {
+		absTick = -absTick
+	}
+	// Exponentiation by squaring.
+	temp := new(big.Float).SetPrec(256).Copy(base)
+	remaining := absTick
+	for remaining > 0 {
+		if remaining%2 == 1 {
+			priceFloat.Mul(priceFloat, temp)
 		}
-		adjusted = 1.0 / adjusted
+		temp.Mul(temp, temp)
+		remaining /= 2
+	}
+	if tick < 0 {
+		priceFloat.Quo(new(big.Float).SetPrec(256).SetFloat64(1.0), priceFloat)
 	}
 
-	// Scale to 8 decimals using big.Float to avoid uint64 overflow for large prices.
-	scaledFloat := new(big.Float).SetFloat64(adjusted)
-	scaledFloat.Mul(scaledFloat, new(big.Float).SetFloat64(1e8))
-	result, _ := scaledFloat.Int(nil)
+	// Adjust for decimals: actual price = priceFloat * 10^decimals0 / 10^decimals1.
+	dec0 := new(big.Float).SetPrec(256).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil))
+	dec1 := new(big.Float).SetPrec(256).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil))
+	adjusted := new(big.Float).SetPrec(256).Mul(priceFloat, dec0)
+	adjusted.Quo(adjusted, dec1)
+
+	if !token0IsBase {
+		if adjusted.Sign() == 0 {
+			return new(big.Int)
+		}
+		adjusted.Quo(new(big.Float).SetPrec(256).SetFloat64(1.0), adjusted)
+	}
+
+	// Scale to 8 decimals.
+	scale8 := new(big.Float).SetPrec(256).SetFloat64(1e8)
+	adjusted.Mul(adjusted, scale8)
+	result, _ := adjusted.Int(nil)
 	return result
 }
 
