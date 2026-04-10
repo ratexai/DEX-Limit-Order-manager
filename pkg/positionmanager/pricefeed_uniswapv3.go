@@ -204,12 +204,31 @@ func (f *UniswapV3PriceFeed) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (f *UniswapV3PriceFeed) LookupPool(ctx context.Context, pair TokenPair) (PoolConfig, error) {
-	pool, ok := f.pools[pair]
-	if !ok {
-		return PoolConfig{}, fmt.Errorf("no pool configured for pair %v", pair)
+func (f *UniswapV3PriceFeed) LookupPool(
+	ctx context.Context,
+	base common.Address,
+	quote common.Address,
+	chainID uint64,
+) (PoolConfig, error) {
+	pool, ok := f.pools[TokenPair{
+		Base:    base,
+		Quote:   quote,
+		ChainID: chainID,
+	}]
+	if ok {
+		return pool, nil
 	}
-	return pool, nil
+
+	pool, ok = f.pools[TokenPair{
+		Base:    quote,
+		Quote:   base,
+		ChainID: chainID,
+	}]
+	if ok {
+		return pool, nil
+	}
+
+	return PoolConfig{}, fmt.Errorf("no pool configured for base: %v, quote: %v, chain_id: %v", base, quote, chainID)
 }
 
 // pollLoop polls at regular intervals and publishes price updates.
